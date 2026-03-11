@@ -1,0 +1,56 @@
+{
+  "name": "npzview",
+  "displayName": "NPZ Viewer",
+  "description": "View variables, shapes, and dtypes in NumPy .npz files",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Data Science",
+    "Other"
+  ],
+  "activationEvents": [
+    "onCustomEditor:npz.preview"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "npz",
+        "aliases": [
+          "NPZ"
+        ],
+        "extensions": [
+          ".npz"
+        ]
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "npz.preview",
+        "displayName": "NPZ Preview",
+        "priority": "default",
+        "selector": [
+          {
+            "filenamePattern": "*.npz"
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^20",
+    "@types/vscode": "^1.96.0",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.10"
+  }
+}
