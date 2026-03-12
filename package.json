@@ -1,8 +1,8 @@
 {
   "name": "npzview",
   "displayName": "NPZ Viewer",
-  "description": "View variables, shapes, and dtypes in NumPy .npz files",
-  "version": "0.0.1",
+  "description": "View variables, shapes, and dtypes in NumPy .npy and .npz files",
+  "version": "0.1.0",
   "engines": {
     "vscode": "^1.96.0"
   },
@@ -22,18 +22,22 @@
           "NPZ"
         ],
         "extensions": [
-          ".npz"
+          ".npz",
+          ".npy"
         ]
       }
     ],
     "customEditors": [
       {
         "viewType": "npz.preview",
-        "displayName": "NPZ Preview",
+        "displayName": "NPZ/NPY Preview",
         "priority": "default",
         "selector": [
           {
             "filenamePattern": "*.npz"
+          },
+          {
+            "filenamePattern": "*.npy"
           }
         ]
       }

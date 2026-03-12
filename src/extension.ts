@@ -140,29 +140,252 @@ function parseNpyHeader(buffer: Buffer): { shape: string; dtype: string } {
   }
 }
 
+function generateDataPreview(buffer: Buffer, header: { shape: string; dtype: string }, varName: string): { html: string; stats?: any } {
+  try {
+    // Parse dtype to get type info
+    const dtypeMatch = header.dtype.match(/^([<>|=|])([ifuScVOd])(\d+)?/);
+    if (!dtypeMatch) return { html: '<p>Unable to parse data: invalid dtype</p>' };
+
+    const [_, byteOrder, typeChar, sizeStr] = dtypeMatch;
+    const sizeBytes = sizeStr ? parseInt(sizeStr) : 8;
+
+    // Get data offset
+    let dataOffset = 0;
+    const major = buffer[6];
+    if (major === 1) {
+      dataOffset = 10 + buffer.readUInt16LE(8);
+    } else if (major === 2) {
+      dataOffset = 12 + buffer.readUInt32LE(8);
+    }
+
+    const dataView = new DataView(buffer.buffer, buffer.byteOffset + dataOffset);
+
+    // Parse shape to get total elements
+    const shapeParts = header.shape.match(/\[(.*?)\]/)?.[1]?.split(',').map(s => s.trim()) || ['scalar'];
+    const isScalar = shapeParts.length === 1 && shapeParts[0] === 'scalar';
+    const totalElements = isScalar ? 1 : shapeParts.reduce((acc: number, dim: string) => acc * parseInt(dim), 1);
+
+    // Calculate statistics for numeric types
+    let statsHtml = '';
+    if (['i', 'u', 'f'].includes(typeChar) || typeChar === 'd' || typeChar === 'e') {
+      const stats = calculateStats(dataView, byteOrder, typeChar, sizeBytes, totalElements);
+      if (stats) {
+        statsHtml = `
+          <div class="stats">
+            <strong>Statistics:</strong><br>
+            Min: ${stats.min}<br>
+            Max: ${stats.max}<br>
+            Mean: ${stats.mean}${stats.std !== undefined ? `<br>Std Dev: ${stats.std}` : ''}
+          </div>
+        `;
+      }
+    }
+
+    // Get first 100 values
+    const maxPreview = 100;
+    const previewCount = Math.min(totalElements, maxPreview);
+    const values: any[] = [];
+
+    for (let i = 0; i < previewCount; i++) {
+      const val = readDataValue(dataView, byteOrder, typeChar, sizeBytes, i);
+      values.push(val);
+    }
+
+    // Format values for display
+    let valuesHtml = '';
+    if (previewCount > 20) {
+      // Show as table for larger arrays
+      const chunkSize = 10;
+      const chunks: string[][] = [];
+      for (let i = 0; i < values.length; i += chunkSize) {
+        chunks.push(values.slice(i, i + chunkSize).map(v => formatValue(v)));
+      }
+      valuesHtml = chunks.map(chunk => `<div class="value-row">${chunk.join(' ')}</div>`).join('');
+    } else {
+      valuesHtml = values.map(v => formatValue(v)).join(', ');
+    }
+
+    const moreIndicator = totalElements > maxPreview ? `<br><em>(showing first ${maxPreview} of ${totalElements.toLocaleString()} values)</em>` : '';
+
+    return {
+      html: `
+        <div class="data-preview">
+          ${statsHtml}
+          <div class="values">
+            ${valuesHtml}
+          </div>
+          ${moreIndicator}
+        </div>
+      `,
+      stats: { min: 0, max: 0, mean: 0 } // Placeholder
+    };
+  } catch (error) {
+    return { html: `<p>Error generating preview: ${error instanceof Error ? error.message : String(error)}</p>` };
+  }
+}
+
+function calculateStats(dataView: DataView, byteOrder: string, typeChar: string, sizeBytes: number, count: number): { min: number; max: number; mean: number; std?: number } | null {
+  if (count === 0 || count > 1000000) return null; // Skip min/max/mean for very large arrays (>1M elements)
+
+  let min = Infinity;
+  let max = -Infinity;
+  let sum = 0;
+  const sampleSize = Math.min(count, 10000); // Sample up to 10,000 values for min/max/mean
+
+  for (let i = 0; i < sampleSize; i++) {
+    const val = readDataValue(dataView, byteOrder, typeChar, sizeBytes, i);
+    if (typeof val === 'number') {
+      min = Math.min(min, val);
+      max = Math.max(max, val);
+      sum += val;
+    }
+  }
+
+  if (min === Infinity) return null;
+
+  const mean = sum / sampleSize;
+
+  // Calculate standard deviation (only for smaller samples)
+  let std = undefined;
+  if (count <= 100) {
+    const stdSampleSize = Math.min(count, 100);
+    let sumSquares = 0;
+    for (let i = 0; i < stdSampleSize; i++) {
+      const val = readDataValue(dataView, byteOrder, typeChar, sizeBytes, i);
+      if (typeof val === 'number') {
+        const diff = val - mean;
+        sumSquares += diff * diff;
+      }
+    }
+    std = Math.sqrt(sumSquares / stdSampleSize);
+  }
+
+  return { min, max, mean, std };
+}
+
+function readDataValue(dataView: DataView, byteOrder: string, typeChar: string, sizeBytes: number, index: number): any {
+  const offset = index * sizeBytes;
+
+  switch (typeChar) {
+    case 'i': // signed integer
+      switch (sizeBytes) {
+        case 1: return dataView.getInt8(offset);
+        case 2: return byteOrder === '<' ? dataView.getInt16(offset, true) : byteOrder === '>' ? dataView.getInt16(offset, false) : dataView.getInt16(offset);
+        case 4: return byteOrder === '<' ? dataView.getInt32(offset, true) : byteOrder === '>' ? dataView.getInt32(offset, false) : dataView.getInt32(offset);
+        case 8:
+          // Int64 not natively supported in DataView, approximate with number
+          const low = byteOrder === '<' ? dataView.getUint32(offset, true) : byteOrder === '>' ? dataView.getUint32(offset, false) : dataView.getUint32(offset);
+          const high = byteOrder === '<' ? dataView.getInt32(offset + 4, true) : byteOrder === '>' ? dataView.getInt32(offset + 4, false) : dataView.getInt32(offset + 4);
+          return (high * 0x100000000) + (low >>> 0);
+      }
+      break;
+    case 'u': // unsigned integer
+      switch (sizeBytes) {
+        case 1: return dataView.getUint8(offset);
+        case 2: return byteOrder === '<' ? dataView.getUint16(offset, true) : byteOrder === '>' ? dataView.getUint16(offset, false) : dataView.getUint16(offset);
+        case 4: return byteOrder === '<' ? dataView.getUint32(offset, true) : byteOrder === '>' ? dataView.getUint32(offset, false) : dataView.getUint32(offset);
+        case 8:
+          // Uint64 not natively supported in DataView, approximate with number
+          const low = byteOrder === '<' ? dataView.getUint32(offset, true) : byteOrder === '>' ? dataView.getUint32(offset, false) : dataView.getUint32(offset);
+          const high = byteOrder === '<' ? dataView.getUint32(offset + 4, true) : byteOrder === '>' ? dataView.getUint32(offset + 4, false) : dataView.getUint32(offset + 4);
+          return (high * 0x100000000) + low;
+      }
+      break;
+    case 'f': // float
+      switch (sizeBytes) {
+        case 2: return 'float16'; // Float16 not natively supported
+        case 4: return byteOrder === '<' ? dataView.getFloat32(offset, true) : byteOrder === '>' ? dataView.getFloat32(offset, false) : dataView.getFloat32(offset);
+        case 8: return byteOrder === '<' ? dataView.getFloat64(offset, true) : byteOrder === '>' ? dataView.getFloat64(offset, false) : dataView.getFloat64(offset);
+      }
+      break;
+    case 'd': // double (float64)
+      return byteOrder === '<' ? dataView.getFloat64(offset, true) : byteOrder === '>' ? dataView.getFloat64(offset, false) : dataView.getFloat64(offset);
+    case 'e': // float16 placeholder
+      return 'float16';
+    case 'b': // bytes
+    case 'S': // string
+      return dataView.getUint8(offset);
+  }
+
+  return '?';
+}
+
+function formatValue(val: any): string {
+  if (typeof val === 'number') {
+    // Format for readability
+    if (Number.isInteger(val) && Math.abs(val) > 1000) {
+      return val.toLocaleString();
+    }
+    return parseFloat(val.toFixed(4)).toString();
+  }
+  return String(val);
+}
+
 class NpzContentProvider {
   async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
     try {
-      const zip = new AdmZip.default(uri.fsPath);
-      const entries = zip.getEntries();
-
+      const isNpz = uri.path.endsWith('.npz');
       const rows: string[] = [];
+      const previews: string[] = [];
 
-      for (const entry of entries) {
-        if (!entry.entryName.endsWith('.npy')) continue;
+      if (isNpz) {
+        // Handle .npz files (ZIP archives with multiple .npy files)
+        const zip = new AdmZip.default(uri.fsPath);
+        const entries = zip.getEntries();
 
-        const buffer = zip.readFile(entry)!;
+        for (const entry of entries) {
+          if (!entry.entryName.endsWith('.npy')) continue;
+
+          const buffer = zip.readFile(entry)!;
+          const header = parseNpyHeader(buffer);
+          const safeShape = header.shape.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          const safeDtype = header.dtype.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          const varName = entry.entryName.replace('.npy', '');
+
+          // Generate data preview
+          const dataPreview = generateDataPreview(buffer, header, varName);
+
+          rows.push(`
+            <tr class="clickable-row">
+              <td>
+                <details>
+                  <summary style="cursor: pointer; outline: none;">${varName}</summary>
+                  <div class="preview-content">
+                    ${dataPreview.html}
+                  </div>
+                </details>
+              </td>
+              <td>${safeShape}</td>
+              <td>${safeDtype}</td>
+            </tr>
+          `);
+        }
+      } else {
+        // Handle .npy files (single array file)
+        const fs = await import('fs');
+        const buffer = Buffer.from(await fs.promises.readFile(uri.fsPath));
         const header = parseNpyHeader(buffer);
 
         const safeShape = header.shape.replace(/</g, '&lt;').replace(/>/g, '&gt;');
         const safeDtype = header.dtype.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+        // Generate data preview
+        const dataPreview = generateDataPreview(buffer, header, 'array');
+
         rows.push(`
-          <tr>
-            <td>${entry.entryName.replace('.npy', '')}</td>
-            <td>${safeShape}</td>
-            <td>${safeDtype}</td>
-          </tr>
-        `);
+          <tr class="clickable-row">
+              <td>
+                <details>
+                    <summary style="cursor: pointer; outline: none;">array ⬇</summary>
+                    <div class="preview-content">
+                      ${dataPreview.html}
+                    </div>
+                </details>
+              </td>
+              <td>${safeShape}</td>
+              <td>${safeDtype}</td>
+            </tr>
+          `);
       }
 
       return `
@@ -200,14 +423,43 @@ class NpzContentProvider {
             tr:hover {
               background-color: var(--vscode-editor-inactiveSelectionBackground);
             }
+            summary:hover {
+              background-color: var(--vscode-editor-inactiveSelectionBackground);
+            }
+            .data-preview {
+              margin-top: 20px;
+              margin-bottom: 30px;
+              padding: 15px;
+              background-color: var(--vscode-editor-inactiveSelectionBackground);
+              border-radius: 4px;
+            }
+            .stats {
+              margin-bottom: 15px;
+              padding: 10px;
+              background-color: var(--vscode-editor-background);
+              border-radius: 3px;
+            }
+            .values {
+              font-family: monospace;
+              font-size: 13px;
+              background-color: var(--vscode-editor-background);
+              padding: 10px;
+              border-radius: 3px;
+              white-space: pre-wrap;
+              word-break: break-all;
+            }
+            .value-row {
+              margin-bottom: 5px;
+            }
           </style>
         </head>
         <body>
           <h1>NPZ Contents: ${uri.path.split('/').pop()}</h1>
           <table>
-            <thead><tr><th>Variable</th><th>Shape</th><th>Dtype</th></tr></thead>
+            <thead><tr><th>Variable</th><th>Shape</th><th>Dtype</th><th></th></tr></thead>
             <tbody>${rows.join('')}</tbody>
           </table>
+        </body>
         </body>
         </html>
       `;
