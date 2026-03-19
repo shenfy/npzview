@@ -13,7 +13,7 @@ A lightweight VS Code extension for viewing NumPy `.npy` and `.npz` files - disp
 - **Statistics** - Min, max, mean for numeric arrays (arrays up to 1M elements)
 - **Standard Deviation** - For arrays ≤ 100 elements
 - **First 100 Values** - Preview of array data as flat list or table
-- **Minimal Dependencies** - Only requires `adm-zip` (~50KB)
+- **Minimal Dependencies** - Only requires `yauzl` for ZIP reading
 
 ## Installation
 
@@ -37,7 +37,7 @@ Supports all NumPy dtypes:
 - Integers: `int8`, `int16`, `int32`, `int64`
 - Unsigned: `uint8`, `uint16`, `uint32`, `uint64`
 - Floats: `float16`, `float32`, `float64`
-- Complex, bytes, strings, unicode, void, objects
+- Boolean, complex, bytes, strings, unicode, void, objects
 
 Shows endianness (little-endian, big-endian, native).
 

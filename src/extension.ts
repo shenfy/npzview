@@ -1,5 +1,21 @@
 import * as vscode from 'vscode';
-import * as AdmZip from 'adm-zip';
+import * as yauzl from 'yauzl';
+
+type NpyHeader = {
+  shape: string;
+  dtype: string;
+  dataOffset: number;
+};
+
+type PreviewPlan = {
+  byteOrder: string;
+  typeChar: string;
+  sizeBytes: number;
+  totalElements: number;
+  previewCount: number;
+};
+
+const LARGE_ENTRY_THRESHOLD = 8 * 1024 * 1024;
 
 function parseDtype(dtypeCode: string): string {
   // NumPy dtype format: [byte-order][type][size]
@@ -28,7 +44,7 @@ function parseDtype(dtypeCode: string): string {
     case 'u': typeName = 'uint'; break;
     case 'f': typeName = 'float'; break;
     case 'c': typeName = 'complex'; break;
-    case 'b': typeName = 'bytes'; break;
+    case 'b': typeName = 'bool'; break;
     case 'S': typeName = 'string'; break;
     case 'U': typeName = 'unicode'; break;
     case 'V': typeName = 'void'; break;
@@ -40,12 +56,14 @@ function parseDtype(dtypeCode: string): string {
 
   let humanReadable = '';
   if (typeChar === 'b' || typeChar === 'S') {
-    // bytes and strings don't use standard int sizes
+    // booleans and strings don't use standard int sizes
     if (typeChar === 'b') {
-      humanReadable = sizeBytes === 1 ? 'int8' : `bytes${sizeBytes * 8}`;
+      humanReadable = 'bool';
     } else {
       humanReadable = `string(${sizeBytes})`;
     }
+  } else if (typeChar === 'U') {
+    humanReadable = `unicode(${sizeBytes})`;
   } else if (typeChar === 'd') {
     humanReadable = 'float64';
   } else if (typeChar === 'e') {
@@ -62,17 +80,17 @@ function parseDtype(dtypeCode: string): string {
   return `${dtypeCode} (${humanReadable})`;
 }
 
-function parseNpyHeader(buffer: Buffer): { shape: string; dtype: string } {
+function parseNpyHeader(buffer: Buffer): NpyHeader {
   try {
     if (buffer.length < 10) {
-      return { shape: '?', dtype: 'too short' };
+      return { shape: '?', dtype: 'too short', dataOffset: 0 };
     }
 
     // Check magic bytes: \x93NUMPY (0x93 0x4E 0x55 0x4D 0x50 0x59)
     const expectedMagic = [0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59];
     for (let i = 0; i < 6; i++) {
       if (buffer[i] !== expectedMagic[i]) {
-        return { shape: '?', dtype: `magic mismatch at ${i}: got ${buffer[i]}, expected ${expectedMagic[i]}` };
+        return { shape: '?', dtype: `magic mismatch at ${i}: got ${buffer[i]}, expected ${expectedMagic[i]}`, dataOffset: 0 };
       }
     }
 
@@ -82,38 +100,37 @@ function parseNpyHeader(buffer: Buffer): { shape: string; dtype: string } {
 
     let headerLen: number;
     let headerStart: number;
+    let headerEncoding: BufferEncoding;
 
     if (major === 1) {
       // .npy v1.0: header length is 2 bytes (uint16) at offset 8
       headerLen = buffer.readUInt16LE(8);
       headerStart = 10;
-    } else if (major === 2) {
-      // .npy v2.0: header length is 4 bytes (uint32) at offset 8
+      headerEncoding = 'latin1';
+    } else if (major === 2 || major === 3) {
+      // .npy v2.0/v3.0: header length is 4 bytes (uint32) at offset 8
       headerLen = buffer.readUInt32LE(8);
       headerStart = 12;
+      headerEncoding = major === 3 ? 'utf8' : 'latin1';
     } else {
-      return { shape: '?', dtype: `unknown v${major}.${minor}` };
+      return { shape: '?', dtype: `unknown v${major}.${minor}`, dataOffset: 0 };
     }
 
     if (buffer.length < headerStart + headerLen) {
-      return { shape: '?', dtype: `header too long: need ${headerStart + headerLen}, got ${buffer.length}` };
+      return { shape: '?', dtype: `header too long: need ${headerStart + headerLen}, got ${buffer.length}`, dataOffset: 0 };
     }
 
-    // Read header string (Latin1 for binary safety)
-    const headerStr = buffer.slice(headerStart, headerStart + headerLen).toString('latin1');
+    // Read header string using the version-appropriate encoding.
+    const headerStr = buffer.slice(headerStart, headerStart + headerLen).toString(headerEncoding);
 
-    // Parse Python dict-like header using regex
+    // Parse Python dict-like header using regex.
     // Format: {'descr': '<f8', 'fortran_order': False, 'shape': (10, 28, 28), }
 
-    // Parse dtype - extract from "descr': '<dtype>'"
+    // Parse dtype - extract from "descr: '<dtype>'" or "descr: \"<dtype>\""
     let dtype = 'unknown';
-    const descrIndex = headerStr.indexOf("descr': '");
-    if (descrIndex !== -1) {
-      const afterDescr = headerStr.substring(descrIndex + "descr': '".length);
-      const closeQuoteIndex = afterDescr.indexOf("'");
-      if (closeQuoteIndex !== -1) {
-        dtype = afterDescr.substring(0, closeQuoteIndex).trim();
-      }
+    const descrMatch = headerStr.match(/descr['"]\s*:\s*['"]([^'"]+)['"]/);
+    if (descrMatch) {
+      dtype = descrMatch[1].trim();
     }
 
     // Parse shape - look for "shape': (dim1, dim2, ...)" or "shape': ()" for scalars
@@ -134,20 +151,199 @@ function parseNpyHeader(buffer: Buffer): { shape: string; dtype: string } {
       }
     }
 
-    return { shape: `[${shape}]`, dtype: parseDtype(dtype) };
+    return { shape: `[${shape}]`, dtype: parseDtype(dtype), dataOffset: headerStart + headerLen };
   } catch (error) {
-    return { shape: '?', dtype: 'parse error' };
+    return { shape: '?', dtype: 'parse error', dataOffset: 0 };
   }
 }
 
-function generateDataPreview(buffer: Buffer, header: { shape: string; dtype: string }, varName: string): { html: string; stats?: any } {
+function parsePreviewPlan(header: NpyHeader, buffer: Buffer): PreviewPlan | null {
+  const dtypeMatch = header.dtype.match(/^([<>|=|])([ifuScVOdb])(\d+)?/);
+  if (!dtypeMatch) return null;
+
+  const [, byteOrder, typeChar, sizeStr] = dtypeMatch;
+  const sizeBytes = sizeStr ? parseInt(sizeStr) : 8;
+
+  const shapeParts = header.shape.match(/\[(.*?)\]/)?.[1]?.split(',').map(s => s.trim()).filter(s => s !== '') || ['scalar'];
+  const isScalar = shapeParts.length === 1 && shapeParts[0] === 'scalar';
+  const totalElements = isScalar ? 1 : shapeParts.reduce((acc: number, dim: string) => acc * parseInt(dim), 1);
+
+  return {
+    byteOrder,
+    typeChar,
+    sizeBytes,
+    totalElements,
+    previewCount: Math.min(totalElements, 100),
+  };
+}
+
+function getNpyPreviewByteCount(header: NpyHeader, buffer: Buffer): number | null {
+  const plan = parsePreviewPlan(header, buffer);
+  if (!plan) return null;
+  return header.dataOffset + (plan.previewCount * plan.sizeBytes);
+}
+
+async function readNpyEntryPreview(zipFile: yauzl.ZipFile, entry: yauzl.Entry): Promise<{ buffer: Buffer; header: NpyHeader; truncated: boolean }> {
+  return new Promise((resolve, reject) => {
+    zipFile.openReadStream(entry, (error, stream) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      if (!stream) {
+        reject(new Error(`Unable to read ZIP entry ${entry.fileName}`));
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      let totalLength = 0;
+      let header: NpyHeader | null = null;
+      let previewByteCount = 0;
+      let resolved = false;
+
+      const finish = (buffer: Buffer, currentHeader: NpyHeader, truncated: boolean) => {
+        if (resolved) return;
+        resolved = true;
+        resolve({ buffer, header: currentHeader, truncated });
+      };
+
+      const fail = (err: unknown) => {
+        if (resolved) return;
+        resolved = true;
+        reject(err);
+      };
+
+      stream.on('data', (chunk: Buffer | Uint8Array) => {
+        if (resolved) return;
+
+        const buf = Buffer.from(chunk);
+        chunks.push(buf);
+        totalLength += buf.length;
+
+        if (!header) {
+          const probe = Buffer.concat(chunks, totalLength);
+          const parsed = parseNpyHeader(probe);
+          if (parsed.dtype !== 'too short' && !parsed.dtype.startsWith('header too long') && !parsed.dtype.startsWith('magic mismatch') && !parsed.dtype.startsWith('unknown v') && parsed.dtype !== 'parse error') {
+            header = parsed;
+            previewByteCount = getNpyPreviewByteCount(header, probe) ?? 0;
+          }
+        }
+
+        if (header && previewByteCount > 0 && totalLength >= previewByteCount && entry.uncompressedSize > LARGE_ENTRY_THRESHOLD) {
+          stream.destroy();
+          finish(Buffer.concat(chunks, totalLength), header, true);
+        }
+      });
+
+      stream.on('error', fail);
+      stream.on('end', () => {
+        if (resolved) return;
+        const probe = Buffer.concat(chunks, totalLength);
+        const parsed = header ?? parseNpyHeader(probe);
+        finish(probe, parsed, entry.uncompressedSize > 0 && totalLength < entry.uncompressedSize);
+      });
+    });
+  });
+}
+
+function openZipFile(filePath: string): Promise<yauzl.ZipFile> {
+  return new Promise((resolve, reject) => {
+    yauzl.open(
+      filePath,
+      {
+        lazyEntries: true,
+        autoClose: true,
+      },
+      (error: Error | null, zipFile: yauzl.ZipFile | undefined) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        if (!zipFile) {
+          reject(new Error('Unable to open ZIP archive'));
+          return;
+        }
+
+        resolve(zipFile);
+      }
+    );
+  });
+}
+
+function readZipEntryBuffer(zipFile: yauzl.ZipFile, entry: yauzl.Entry): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    zipFile.openReadStream(entry, (error, stream) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      if (!stream) {
+        reject(new Error(`Unable to read ZIP entry ${entry.fileName}`));
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      stream.on('data', (chunk: Buffer | Uint8Array) => {
+        chunks.push(Buffer.from(chunk));
+      });
+      stream.on('error', reject);
+      stream.on('end', () => {
+        resolve(Buffer.concat(chunks));
+      });
+    });
+  });
+}
+
+async function readNpzEntries(filePath: string): Promise<Array<{ entryName: string; buffer: Buffer }>> {
+  const zipFile = await openZipFile(filePath);
+
+  return new Promise((resolve, reject) => {
+    const entries: Array<{ entryName: string; buffer: Buffer }> = [];
+
+    zipFile.on('error', reject);
+
+    zipFile.on('entry', (entry: yauzl.Entry) => {
+      if (entry.fileName.endsWith('/') || !entry.fileName.endsWith('.npy')) {
+        zipFile.readEntry();
+        return;
+      }
+
+      readZipEntryBuffer(zipFile, entry)
+        .then((buffer) => {
+          entries.push({ entryName: entry.fileName, buffer });
+          zipFile.readEntry();
+        })
+        .catch((error) => {
+          zipFile.close();
+          reject(error);
+        });
+    });
+
+    zipFile.on('end', () => {
+      resolve(entries);
+    });
+
+    zipFile.readEntry();
+  });
+}
+
+function generateDataPreview(
+  buffer: Buffer,
+  header: { shape: string; dtype: string },
+  varName: string,
+  options?: { includeStats?: boolean }
+): { html: string; stats?: any } {
   try {
     // Parse dtype to get type info
-    const dtypeMatch = header.dtype.match(/^([<>|=|])([ifuScVOd])(\d+)?/);
+    const dtypeMatch = header.dtype.match(/^([<>|=|])([ifuScVOdUb])(\d+)?/);
     if (!dtypeMatch) return { html: '<p>Unable to parse data: invalid dtype</p>' };
 
     const [_, byteOrder, typeChar, sizeStr] = dtypeMatch;
-    const sizeBytes = sizeStr ? parseInt(sizeStr) : 8;
+    const dtypeSize = sizeStr ? parseInt(sizeStr) : 8;
+    const itemSizeBytes = typeChar === 'U' ? dtypeSize * 4 : dtypeSize;
 
     // Get data offset
     let dataOffset = 0;
@@ -167,8 +363,8 @@ function generateDataPreview(buffer: Buffer, header: { shape: string; dtype: str
 
     // Calculate statistics for numeric types
     let statsHtml = '';
-    if (['i', 'u', 'f'].includes(typeChar) || typeChar === 'd' || typeChar === 'e') {
-      const stats = calculateStats(dataView, byteOrder, typeChar, sizeBytes, totalElements);
+    if (options?.includeStats !== false && (['i', 'u', 'f'].includes(typeChar) || typeChar === 'd' || typeChar === 'e')) {
+      const stats = calculateStats(dataView, byteOrder, typeChar, itemSizeBytes, totalElements);
       if (stats) {
         statsHtml = `
           <div class="stats">
@@ -187,7 +383,7 @@ function generateDataPreview(buffer: Buffer, header: { shape: string; dtype: str
     const values: any[] = [];
 
     for (let i = 0; i < previewCount; i++) {
-      const val = readDataValue(dataView, byteOrder, typeChar, sizeBytes, i);
+      const val = readDataValue(dataView, byteOrder, typeChar, itemSizeBytes, i);
       values.push(val);
     }
 
@@ -217,7 +413,7 @@ function generateDataPreview(buffer: Buffer, header: { shape: string; dtype: str
           ${moreIndicator}
         </div>
       `,
-      stats: { min: 0, max: 0, mean: 0 } // Placeholder
+      stats: options?.includeStats === false ? undefined : { min: 0, max: 0, mean: 0 }
     };
   } catch (error) {
     return { html: `<p>Error generating preview: ${error instanceof Error ? error.message : String(error)}</p>` };
@@ -305,6 +501,19 @@ function readDataValue(dataView: DataView, byteOrder: string, typeChar: string, 
     case 'b': // bytes
     case 'S': // string
       return dataView.getUint8(offset);
+    case 'U': {
+      const charCount = Math.floor(sizeBytes / 4);
+      let text = '';
+      for (let i = 0; i < charCount; i++) {
+        const codePointOffset = offset + (i * 4);
+        const codePoint = byteOrder === '>'
+          ? dataView.getUint32(codePointOffset, false)
+          : dataView.getUint32(codePointOffset, true);
+        if (codePoint === 0) continue;
+        text += String.fromCodePoint(codePoint);
+      }
+      return text;
+    }
   }
 
   return '?';
@@ -326,40 +535,53 @@ class NpzContentProvider {
     try {
       const isNpz = uri.path.endsWith('.npz');
       const rows: string[] = [];
-      const previews: string[] = [];
 
       if (isNpz) {
         // Handle .npz files (ZIP archives with multiple .npy files)
-        const zip = new AdmZip.default(uri.fsPath);
-        const entries = zip.getEntries();
+        const zipFile = await openZipFile(uri.fsPath);
 
-        for (const entry of entries) {
-          if (!entry.entryName.endsWith('.npy')) continue;
+        await new Promise<void>((resolve, reject) => {
+          zipFile.on('error', reject);
 
-          const buffer = zip.readFile(entry)!;
-          const header = parseNpyHeader(buffer);
-          const safeShape = header.shape.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-          const safeDtype = header.dtype.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-          const varName = entry.entryName.replace('.npy', '');
+          zipFile.on('entry', (entry: yauzl.Entry) => {
+            if (entry.fileName.endsWith('/') || !entry.fileName.endsWith('.npy')) {
+              zipFile.readEntry();
+              return;
+            }
 
-          // Generate data preview
-          const dataPreview = generateDataPreview(buffer, header, varName);
+            readNpyEntryPreview(zipFile, entry)
+              .then(({ buffer, header, truncated }) => {
+                const safeShape = header.shape.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const safeDtype = header.dtype.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const varName = entry.fileName.replace(/\.npy$/i, '');
+                const dataPreview = generateDataPreview(buffer, header, varName, { includeStats: !truncated });
 
-          rows.push(`
-            <tr class="clickable-row">
-              <td>
-                <details>
-                  <summary style="cursor: pointer; outline: none;">${varName}</summary>
-                  <div class="preview-content">
-                    ${dataPreview.html}
-                  </div>
-                </details>
-              </td>
-              <td>${safeShape}</td>
-              <td>${safeDtype}</td>
-            </tr>
-          `);
-        }
+                rows.push(`
+                  <tr class="clickable-row">
+                    <td>
+                      <details>
+                        <summary style="cursor: pointer; outline: none;">${varName}</summary>
+                        <div class="preview-content">
+                          ${dataPreview.html}
+                        </div>
+                      </details>
+                    </td>
+                    <td>${safeShape}</td>
+                    <td>${safeDtype}</td>
+                  </tr>
+                `);
+
+                zipFile.readEntry();
+              })
+              .catch((error) => {
+                zipFile.close();
+                reject(error);
+              });
+          });
+
+          zipFile.on('end', () => resolve());
+          zipFile.readEntry();
+        });
       } else {
         // Handle .npy files (single array file)
         const fs = await import('fs');
@@ -408,6 +630,7 @@ class NpzContentProvider {
               border-collapse: collapse;
               width: 100%;
               max-width: 800px;
+              table-layout: fixed;
             }
             th {
               text-align: left;
@@ -419,6 +642,8 @@ class NpzContentProvider {
             td {
               padding: 10px;
               border-bottom: 1px solid var(--vscode-editor-border);
+              vertical-align: top;
+              overflow-wrap: anywhere;
             }
             tr:hover {
               background-color: var(--vscode-editor-inactiveSelectionBackground);
@@ -426,12 +651,22 @@ class NpzContentProvider {
             summary:hover {
               background-color: var(--vscode-editor-inactiveSelectionBackground);
             }
+            details {
+              width: 100%;
+            }
+            details > summary {
+              white-space: nowrap;
+              overflow: hidden;
+              text-overflow: ellipsis;
+            }
             .data-preview {
               margin-top: 20px;
               margin-bottom: 30px;
               padding: 15px;
               background-color: var(--vscode-editor-inactiveSelectionBackground);
               border-radius: 4px;
+              max-width: 100%;
+              overflow-x: auto;
             }
             .stats {
               margin-bottom: 15px;
@@ -447,6 +682,8 @@ class NpzContentProvider {
               border-radius: 3px;
               white-space: pre-wrap;
               word-break: break-all;
+              max-width: 100%;
+              overflow-x: auto;
             }
             .value-row {
               margin-bottom: 5px;
@@ -456,6 +693,12 @@ class NpzContentProvider {
         <body>
           <h1>NPZ Contents: ${uri.path.split('/').pop()}</h1>
           <table>
+            <colgroup>
+              <col style="width: 46%;">
+              <col style="width: 22%;">
+              <col style="width: 22%;">
+              <col style="width: 10%;">
+            </colgroup>
             <thead><tr><th>Variable</th><th>Shape</th><th>Dtype</th><th></th></tr></thead>
             <tbody>${rows.join('')}</tbody>
           </table>
